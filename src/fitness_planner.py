@@ -1,371 +1,559 @@
 #!/usr/bin/env python3
-"""BlackRoad Fitness Planner — workout planning and progress tracking."""
+"""
+BlackRoad Health & Fitness Monitor
+Production-grade health metrics tracking with anomaly detection and reporting.
+
+Usage:
+    python fitness_planner.py log --user alice --type heart_rate --value 72 --unit bpm
+    python fitness_planner.py summary --user alice --days 7
+    python fitness_planner.py bmi --user alice
+    python fitness_planner.py anomaly --user alice --type heart_rate
+    python fitness_planner.py correlate --user alice --m1 steps --m2 heart_rate
+    python fitness_planner.py report --user alice --format json
+    python fitness_planner.py profile --user alice --age 30 --height 170 --weight 70
+"""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import math
 import sqlite3
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, date
+import statistics
+from dataclasses import dataclass, asdict, field
+from datetime import datetime, timedelta
 from enum import Enum
+from io import StringIO
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
-# ── ANSI Colors ───────────────────────────────────────────────────────────────
-GREEN   = "\033[0;32m"
-RED     = "\033[0;31m"
-YELLOW  = "\033[1;33m"
-CYAN    = "\033[0;36m"
-BLUE    = "\033[0;34m"
-MAGENTA = "\033[0;35m"
-BOLD    = "\033[1m"
-NC      = "\033[0m"
-
-DB_PATH = Path.home() / ".blackroad" / "fitness-planner.db"
+DB_PATH = Path.home() / ".blackroad" / "fitness_planner.db"
 
 
-class MuscleGroup(str, Enum):
-    CHEST     = "chest"
-    BACK      = "back"
-    SHOULDERS = "shoulders"
-    ARMS      = "arms"
-    CORE      = "core"
-    LEGS      = "legs"
-    CARDIO    = "cardio"
-    FULL_BODY = "full_body"
+# ── Enums ──────────────────────────────────────────────────────────────────────
+
+class MetricType(str, Enum):
+    HEART_RATE     = "heart_rate"
+    BLOOD_PRESSURE = "blood_pressure"
+    STEPS          = "steps"
+    SLEEP          = "sleep"
+    CALORIES       = "calories"
+    WEIGHT         = "weight"
+    GLUCOSE        = "glucose"
+    OXYGEN_SAT     = "oxygen_sat"
+    TEMPERATURE    = "temperature"
+    HRV            = "hrv"
 
 
-class Difficulty(str, Enum):
-    BEGINNER     = "beginner"
-    INTERMEDIATE = "intermediate"
-    ADVANCED     = "advanced"
+# Normal ranges: (low_warn, low_normal, high_normal, high_warn)
+NORMAL_RANGES: Dict[str, Tuple[float, float, float, float]] = {
+    MetricType.HEART_RATE:     (40,  60,   100,  150),
+    MetricType.STEPS:          (0,   5000, 15000, 30000),
+    MetricType.SLEEP:          (4,   7,    9,    12),
+    MetricType.CALORIES:       (800, 1500, 3000, 5000),
+    MetricType.WEIGHT:         (30,  50,   120,  250),
+    MetricType.GLUCOSE:        (50,  70,   140,  300),
+    MetricType.OXYGEN_SAT:     (85,  95,   100,  100),
+    MetricType.TEMPERATURE:    (35.0, 36.1, 37.2, 40.0),
+    MetricType.HRV:            (10,  20,   80,   120),
+}
+
+UNITS: Dict[str, str] = {
+    MetricType.HEART_RATE:     "bpm",
+    MetricType.BLOOD_PRESSURE: "mmHg",
+    MetricType.STEPS:          "steps",
+    MetricType.SLEEP:          "hours",
+    MetricType.CALORIES:       "kcal",
+    MetricType.WEIGHT:         "kg",
+    MetricType.GLUCOSE:        "mg/dL",
+    MetricType.OXYGEN_SAT:     "%",
+    MetricType.TEMPERATURE:    "°C",
+    MetricType.HRV:            "ms",
+}
+
+RDA_DAILY: Dict[str, float] = {
+    "steps":    10000,
+    "sleep":    8.0,
+    "calories": 2000,
+}
 
 
-class WorkoutStatus(str, Enum):
-    PLANNED   = "planned"
-    COMPLETED = "completed"
-    SKIPPED   = "skipped"
+# ── Dataclasses ────────────────────────────────────────────────────────────────
+
+@dataclass
+class HealthMetric:
+    id:        int
+    user_id:   str
+    type:      str
+    value:     float
+    unit:      str
+    timestamp: str
+    device:    str
+    notes:     str
+
+    @property
+    def dt(self) -> datetime:
+        return datetime.fromisoformat(self.timestamp)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 @dataclass
-class Exercise:
-    """A named exercise with default parameters."""
+class HealthProfile:
+    user_id:    str
+    age:        int
+    height_cm:  float
+    weight_kg:  float
+    conditions: List[str] = field(default_factory=list)
+    goal_steps: int   = 10000
+    goal_sleep: float = 8.0
+    goal_cal:   int   = 2000
+    created_at: str   = field(default_factory=lambda: datetime.now().isoformat())
+    updated_at: str   = field(default_factory=lambda: datetime.now().isoformat())
 
-    name:          str
-    muscle_group:  MuscleGroup = MuscleGroup.FULL_BODY
-    difficulty:    Difficulty  = Difficulty.INTERMEDIATE
-    default_sets:  int         = 3
-    default_reps:  int         = 10
-    rest_seconds:  int         = 60
-    calories_per_set: float    = 20.0
-    notes:         str         = ""
-    created_at:    str         = field(default_factory=lambda: datetime.now().isoformat())
-    id:            Optional[int] = None
+    @property
+    def bmi(self) -> float:
+        if self.height_cm <= 0:
+            return 0.0
+        h_m = self.height_cm / 100
+        return round(self.weight_kg / (h_m ** 2), 2)
 
-    def muscle_color(self) -> str:
-        return {MuscleGroup.CHEST: CYAN, MuscleGroup.BACK: BLUE,
-                MuscleGroup.SHOULDERS: YELLOW, MuscleGroup.ARMS: GREEN,
-                MuscleGroup.CORE: MAGENTA, MuscleGroup.LEGS: RED,
-                MuscleGroup.CARDIO: YELLOW, MuscleGroup.FULL_BODY: CYAN}.get(self.muscle_group, NC)
+    @property
+    def bmi_category(self) -> str:
+        b = self.bmi
+        if b < 18.5: return "Underweight"
+        if b < 25.0: return "Normal"
+        if b < 30.0: return "Overweight"
+        return "Obese"
 
+    @property
+    def bmr(self) -> float:
+        """Mifflin-St Jeor BMR (assumes male; use +/- 5% for sex adjustment)."""
+        return round(10 * self.weight_kg + 6.25 * self.height_cm - 5 * self.age + 5, 1)
 
-@dataclass
-class WorkoutSet:
-    """Actual performance data for one exercise within a session."""
-
-    exercise_id:  int
-    exercise_name: str = ""
-    sets_done:    int   = 0
-    reps_done:    int   = 0
-    weight_kg:    float = 0.0
-    duration_min: float = 0.0
-
-
-@dataclass
-class WorkoutSession:
-    """A logged workout session."""
-
-    session_date:    str            = field(default_factory=lambda: date.today().isoformat())
-    status:          WorkoutStatus  = WorkoutStatus.PLANNED
-    exercises:       List[dict]     = field(default_factory=list)   # serialized WorkoutSets
-    total_duration:  float          = 0.0
-    total_calories:  float          = 0.0
-    mood:            int            = 5    # 1-10 scale
-    notes:           str            = ""
-    created_at:      str            = field(default_factory=lambda: datetime.now().isoformat())
-    updated_at:      str            = field(default_factory=lambda: datetime.now().isoformat())
-    id:              Optional[int]  = None
-
-    def status_color(self) -> str:
-        return {WorkoutStatus.COMPLETED: GREEN,
-                WorkoutStatus.SKIPPED:   RED,
-                WorkoutStatus.PLANNED:   YELLOW}.get(self.status, NC)
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["bmi"] = self.bmi
+        d["bmi_category"] = self.bmi_category
+        d["bmr"] = self.bmr
+        return d
 
 
-class FitnessPlanner:
-    """SQLite-backed fitness planning and tracking engine."""
+# ── Database ───────────────────────────────────────────────────────────────────
 
-    def __init__(self, db_path: Path = DB_PATH) -> None:
-        self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+def get_conn() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    _init_db(conn)
+    return conn
 
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
 
-    def _init_db(self) -> None:
-        with self._conn() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS exercises (
-                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name              TEXT    UNIQUE NOT NULL,
-                    muscle_group      TEXT    DEFAULT 'full_body',
-                    difficulty        TEXT    DEFAULT 'intermediate',
-                    default_sets      INTEGER DEFAULT 3,
-                    default_reps      INTEGER DEFAULT 10,
-                    rest_seconds      INTEGER DEFAULT 60,
-                    calories_per_set  REAL    DEFAULT 20.0,
-                    notes             TEXT    DEFAULT '',
-                    created_at        TEXT    NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS workout_sessions (
-                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_date     TEXT    NOT NULL,
-                    status           TEXT    DEFAULT 'planned',
-                    exercises        TEXT    DEFAULT '[]',
-                    total_duration   REAL    DEFAULT 0.0,
-                    total_calories   REAL    DEFAULT 0.0,
-                    mood             INTEGER DEFAULT 5,
-                    notes            TEXT    DEFAULT '',
-                    created_at       TEXT    NOT NULL,
-                    updated_at       TEXT    NOT NULL
-                )
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_session_date ON workout_sessions(session_date)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_ex_muscle    ON exercises(muscle_group)")
-            conn.commit()
+def _init_db(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS health_metrics (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id   TEXT    NOT NULL,
+            type      TEXT    NOT NULL,
+            value     REAL    NOT NULL,
+            unit      TEXT    NOT NULL,
+            timestamp TEXT    NOT NULL DEFAULT (datetime('now')),
+            device    TEXT    NOT NULL DEFAULT 'manual',
+            notes     TEXT    NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_hm_user_type ON health_metrics(user_id, type);
+        CREATE INDEX IF NOT EXISTS idx_hm_ts        ON health_metrics(timestamp);
 
-    def _row_to_exercise(self, row: sqlite3.Row) -> Exercise:
-        return Exercise(id=row["id"], name=row["name"],
-                        muscle_group=MuscleGroup(row["muscle_group"]),
-                        difficulty=Difficulty(row["difficulty"]),
-                        default_sets=row["default_sets"], default_reps=row["default_reps"],
-                        rest_seconds=row["rest_seconds"], calories_per_set=row["calories_per_set"],
-                        notes=row["notes"] or "", created_at=row["created_at"])
+        CREATE TABLE IF NOT EXISTS health_profiles (
+            user_id    TEXT PRIMARY KEY,
+            age        INTEGER NOT NULL DEFAULT 0,
+            height_cm  REAL    NOT NULL DEFAULT 0,
+            weight_kg  REAL    NOT NULL DEFAULT 0,
+            conditions TEXT    NOT NULL DEFAULT '[]',
+            goal_steps INTEGER NOT NULL DEFAULT 10000,
+            goal_sleep REAL    NOT NULL DEFAULT 8.0,
+            goal_cal   INTEGER NOT NULL DEFAULT 2000,
+            created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+    """)
+    conn.commit()
 
-    def _row_to_session(self, row: sqlite3.Row) -> WorkoutSession:
-        return WorkoutSession(id=row["id"], session_date=row["session_date"],
-                              status=WorkoutStatus(row["status"]),
-                              exercises=json.loads(row["exercises"] or "[]"),
-                              total_duration=row["total_duration"],
-                              total_calories=row["total_calories"],
-                              mood=row["mood"], notes=row["notes"] or "",
-                              created_at=row["created_at"], updated_at=row["updated_at"])
 
-    def add_exercise(self, name: str, muscle_group: str = "full_body",
-                     difficulty: str = "intermediate", default_sets: int = 3,
-                     default_reps: int = 10, rest_seconds: int = 60,
-                     calories_per_set: float = 20.0, notes: str = "") -> Exercise:
-        """Register a new exercise in the library."""
-        ex = Exercise(name=name, muscle_group=MuscleGroup(muscle_group),
-                      difficulty=Difficulty(difficulty), default_sets=default_sets,
-                      default_reps=default_reps, rest_seconds=rest_seconds,
-                      calories_per_set=calories_per_set, notes=notes)
-        with self._conn() as conn:
-            cur = conn.execute(
-                "INSERT INTO exercises (name,muscle_group,difficulty,default_sets,default_reps,"
-                "rest_seconds,calories_per_set,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (ex.name, ex.muscle_group.value, ex.difficulty.value, ex.default_sets,
-                 ex.default_reps, ex.rest_seconds, ex.calories_per_set, ex.notes, ex.created_at),
-            )
-            conn.commit()
-            ex.id = cur.lastrowid
-        return ex
+# ── Core API ───────────────────────────────────────────────────────────────────
 
-    def list_exercises(self, muscle_group: Optional[str] = None) -> List[Exercise]:
-        sql = "SELECT * FROM exercises WHERE 1=1"
-        params: list = []
-        if muscle_group:
-            sql += " AND muscle_group=?"; params.append(muscle_group)
-        sql += " ORDER BY name"
-        with self._conn() as conn:
-            rows = conn.execute(sql, params).fetchall()
-        return [self._row_to_exercise(r) for r in rows]
+def log_metric(
+    user_id: str,
+    metric_type: str,
+    value: float,
+    unit: str = "",
+    device: str = "manual",
+    notes: str = "",
+) -> HealthMetric:
+    """Persist a single health metric reading."""
+    if not unit:
+        unit = UNITS.get(metric_type, "")
+    ts = datetime.now().isoformat()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO health_metrics(user_id,type,value,unit,timestamp,device,notes)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (user_id, metric_type, value, unit, ts, device, notes),
+        )
+        conn.commit()
+        row_id = cur.lastrowid
+    return HealthMetric(row_id, user_id, metric_type, value, unit, ts, device, notes)
 
-    def log_workout(self, session_date: Optional[str] = None, exercise_ids: Optional[List[int]] = None,
-                    total_duration: float = 0.0, mood: int = 5, notes: str = "") -> WorkoutSession:
-        """Log a completed workout session."""
-        session_date = session_date or date.today().isoformat()
-        exercise_ids = exercise_ids or []
-        exercises_data: list = []
-        total_calories = 0.0
-        if exercise_ids:
-            with self._conn() as conn:
-                for eid in exercise_ids:
-                    row = conn.execute("SELECT * FROM exercises WHERE id=?", (eid,)).fetchone()
-                    if row:
-                        ex = self._row_to_exercise(row)
-                        cal = ex.calories_per_set * ex.default_sets
-                        total_calories += cal
-                        exercises_data.append({"id": ex.id, "name": ex.name,
-                                               "sets": ex.default_sets, "reps": ex.default_reps,
-                                               "calories": cal})
-        now = datetime.now().isoformat()
-        session = WorkoutSession(session_date=session_date, status=WorkoutStatus.COMPLETED,
-                                 exercises=exercises_data, total_duration=total_duration,
-                                 total_calories=total_calories, mood=mood, notes=notes,
-                                 created_at=now, updated_at=now)
-        with self._conn() as conn:
-            cur = conn.execute(
-                "INSERT INTO workout_sessions (session_date,status,exercises,total_duration,"
-                "total_calories,mood,notes,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (session.session_date, session.status.value, json.dumps(session.exercises),
-                 session.total_duration, session.total_calories, session.mood,
-                 session.notes, session.created_at, session.updated_at),
-            )
-            conn.commit()
-            session.id = cur.lastrowid
-        return session
 
-    def list_sessions(self, limit: int = 20) -> List[WorkoutSession]:
-        with self._conn() as conn:
+def get_metrics(
+    user_id: str,
+    metric_type: Optional[str] = None,
+    days: int = 7,
+) -> List[HealthMetric]:
+    since = (datetime.now() - timedelta(days=days)).isoformat()
+    with get_conn() as conn:
+        if metric_type:
             rows = conn.execute(
-                "SELECT * FROM workout_sessions ORDER BY session_date DESC LIMIT ?",
-                (limit,)).fetchall()
-        return [self._row_to_session(r) for r in rows]
-
-    def export_json(self, path: str) -> int:
-        sessions = self.list_sessions(limit=10_000)
-        records  = [asdict(s) | {"status": s.status.value} for s in sessions]
-        with open(path, "w") as fh:
-            json.dump(records, fh, indent=2, default=str)
-        return len(records)
-
-    def stats(self) -> dict:
-        sessions   = self.list_sessions(limit=10_000)
-        completed  = [s for s in sessions if s.status == WorkoutStatus.COMPLETED]
-        avg_mood   = sum(s.mood for s in completed) / len(completed) if completed else 0.0
-        total_cal  = sum(s.total_calories for s in completed)
-        total_dur  = sum(s.total_duration for s in completed)
-        exercises  = self.list_exercises()
-        return {"total_sessions": len(sessions), "completed": len(completed),
-                "total_calories_burned": round(total_cal, 1),
-                "total_duration_min": round(total_dur, 1),
-                "avg_mood": round(avg_mood, 1), "exercises_in_library": len(exercises)}
+                "SELECT * FROM health_metrics WHERE user_id=? AND type=?"
+                " AND timestamp>=? ORDER BY timestamp",
+                (user_id, metric_type, since),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM health_metrics WHERE user_id=?"
+                " AND timestamp>=? ORDER BY timestamp",
+                (user_id, since),
+            ).fetchall()
+    return [HealthMetric(**dict(r)) for r in rows]
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+def upsert_profile(
+    user_id: str,
+    age: int = 0,
+    height_cm: float = 0.0,
+    weight_kg: float = 0.0,
+    conditions: Optional[List[str]] = None,
+    goal_steps: int = 10000,
+    goal_sleep: float = 8.0,
+    goal_cal: int = 2000,
+) -> HealthProfile:
+    conds_json = json.dumps(conditions or [])
+    now = datetime.now().isoformat()
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO health_profiles
+              (user_id,age,height_cm,weight_kg,conditions,goal_steps,goal_sleep,goal_cal,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              age=excluded.age, height_cm=excluded.height_cm,
+              weight_kg=excluded.weight_kg, conditions=excluded.conditions,
+              goal_steps=excluded.goal_steps, goal_sleep=excluded.goal_sleep,
+              goal_cal=excluded.goal_cal, updated_at=excluded.updated_at
+        """, (user_id, age, height_cm, weight_kg, conds_json, goal_steps, goal_sleep, goal_cal, now, now))
+        conn.commit()
+    return get_profile(user_id)
 
-def cmd_list(args: argparse.Namespace, planner: FitnessPlanner) -> None:
-    if args.target == "exercises":
-        items = planner.list_exercises(muscle_group=args.muscle_group)
-        if not items:
-            print(f"{YELLOW}No exercises found.{NC}"); return
-        print(f"\n{BOLD}{BLUE}── Exercise Library ({len(items)}) {'─'*35}{NC}")
-        for ex in items:
-            mc = ex.muscle_color()
-            print(f"  {BOLD}#{ex.id:<4}{NC} {mc}{ex.muscle_group.value:<12}{NC} "
-                  f"{CYAN}{ex.difficulty.value:<14}{NC} {ex.name}")
-            print(f"            {ex.default_sets}x{ex.default_reps}  "
-                  f"rest:{ex.rest_seconds}s  ~{ex.calories_per_set:.0f}cal/set")
+
+def get_profile(user_id: str) -> Optional[HealthProfile]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM health_profiles WHERE user_id=?", (user_id,)
+        ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["conditions"] = json.loads(d["conditions"])
+    return HealthProfile(**d)
+
+
+def get_summary(user_id: str, days: int = 7) -> dict:
+    """Per-metric stats (mean, min, max, stddev, count) for the past N days."""
+    metrics = get_metrics(user_id, days=days)
+    by_type: Dict[str, List[float]] = {}
+    for m in metrics:
+        by_type.setdefault(m.type, []).append(m.value)
+
+    summary: Dict[str, dict] = {}
+    for mtype, vals in by_type.items():
+        summary[mtype] = {
+            "count":  len(vals),
+            "mean":   round(statistics.mean(vals), 2),
+            "min":    min(vals),
+            "max":    max(vals),
+            "stddev": round(statistics.stdev(vals), 2) if len(vals) > 1 else 0.0,
+            "unit":   UNITS.get(mtype, ""),
+            "latest": vals[-1],
+        }
+    return {"user_id": user_id, "days": days, "metrics": summary}
+
+
+def calculate_bmi(user_id: str) -> dict:
+    """Return BMI info from the stored profile; update weight from latest log."""
+    profile = get_profile(user_id)
+    if not profile:
+        return {"error": f"No profile found for '{user_id}'. Run: profile --user {user_id}"}
+
+    # Try to refresh weight from latest metric log
+    w_metrics = get_metrics(user_id, MetricType.WEIGHT, days=365)
+    if w_metrics:
+        latest_w = w_metrics[-1].value
+        profile.weight_kg = latest_w
+
+    return {
+        "user_id":      user_id,
+        "weight_kg":    profile.weight_kg,
+        "height_cm":    profile.height_cm,
+        "age":          profile.age,
+        "bmi":          profile.bmi,
+        "category":     profile.bmi_category,
+        "bmr_kcal":     profile.bmr,
+        "ideal_weight_kg": round(22.5 * (profile.height_cm / 100) ** 2, 1),
+    }
+
+
+def detect_anomaly(user_id: str, metric_type: str, days: int = 30) -> dict:
+    """
+    Flag readings outside the normal range AND statistical outliers (> 2σ).
+    Returns a list of anomalous readings with reason codes.
+    """
+    metrics = get_metrics(user_id, metric_type, days=days)
+    if not metrics:
+        return {"user_id": user_id, "type": metric_type, "anomalies": [], "count": 0}
+
+    values = [m.value for m in metrics]
+    mean   = statistics.mean(values)
+    stddev = statistics.stdev(values) if len(values) > 1 else 0.0
+    bounds = NORMAL_RANGES.get(metric_type)
+
+    anomalies = []
+    for m in metrics:
+        reasons = []
+        if bounds:
+            low_warn, low_norm, high_norm, high_warn = bounds
+            if m.value < low_warn:
+                reasons.append("critically_low")
+            elif m.value < low_norm:
+                reasons.append("below_normal")
+            elif m.value > high_warn:
+                reasons.append("critically_high")
+            elif m.value > high_norm:
+                reasons.append("above_normal")
+        if stddev > 0 and abs(m.value - mean) > 2 * stddev:
+            reasons.append("statistical_outlier_2σ")
+        if reasons:
+            anomalies.append({
+                "id":        m.id,
+                "timestamp": m.timestamp,
+                "value":     m.value,
+                "unit":      m.unit,
+                "reasons":   reasons,
+                "z_score":   round((m.value - mean) / stddev, 2) if stddev else None,
+            })
+
+    return {
+        "user_id":  user_id,
+        "type":     metric_type,
+        "days":     days,
+        "n_total":  len(metrics),
+        "mean":     round(mean, 2),
+        "stddev":   round(stddev, 2),
+        "anomalies": anomalies,
+        "count":    len(anomalies),
+    }
+
+
+def correlate(
+    user_id: str,
+    metric1: str,
+    metric2: str,
+    days: int = 30,
+) -> dict:
+    """
+    Pearson correlation between two metrics sampled over the same day buckets.
+    Returns r, r², interpretation, and per-day data.
+    """
+    since = datetime.now() - timedelta(days=days)
+
+    def daily_avg(mtype: str) -> Dict[str, float]:
+        metrics = get_metrics(user_id, mtype, days=days)
+        buckets: Dict[str, List[float]] = {}
+        for m in metrics:
+            day = m.timestamp[:10]
+            buckets.setdefault(day, []).append(m.value)
+        return {d: statistics.mean(vs) for d, vs in buckets.items()}
+
+    avgs1 = daily_avg(metric1)
+    avgs2 = daily_avg(metric2)
+    common_days = sorted(set(avgs1) & set(avgs2))
+
+    if len(common_days) < 3:
+        return {
+            "user_id": user_id, "metric1": metric1, "metric2": metric2,
+            "r": None, "r2": None,
+            "interpretation": "insufficient_data",
+            "common_days": len(common_days),
+        }
+
+    x = [avgs1[d] for d in common_days]
+    y = [avgs2[d] for d in common_days]
+    n  = len(x)
+    mx, my = statistics.mean(x), statistics.mean(y)
+    sx, sy = statistics.stdev(x), statistics.stdev(y)
+
+    if sx == 0 or sy == 0:
+        r = 0.0
     else:
-        sessions = planner.list_sessions(limit=args.limit)
-        if not sessions:
-            print(f"{YELLOW}No workout sessions found.{NC}"); return
-        print(f"\n{BOLD}{BLUE}── Workout Sessions ({len(sessions)}) {'─'*34}{NC}")
-        for s in sessions:
-            sc = s.status_color()
-            ex_names = ", ".join(e["name"] for e in s.exercises[:3])
-            if len(s.exercises) > 3:
-                ex_names += f" +{len(s.exercises)-3} more"
-            print(f"  {BOLD}{s.session_date}{NC}  {sc}{s.status.value:<12}{NC} "
-                  f"mood:{s.mood}/10  {s.total_calories:.0f}cal  {s.total_duration:.0f}min")
-            if ex_names:
-                print(f"            {ex_names}")
-    print()
+        r = sum((xi - mx) * (yi - my) for xi, yi in zip(x, y)) / ((n - 1) * sx * sy)
+
+    r = max(-1.0, min(1.0, r))
+    ar = abs(r)
+    if ar >= 0.7:   interp = "strong"
+    elif ar >= 0.4: interp = "moderate"
+    elif ar >= 0.2: interp = "weak"
+    else:           interp = "negligible"
+    direction = "positive" if r > 0 else "negative"
+
+    return {
+        "user_id":        user_id,
+        "metric1":        metric1,
+        "metric2":        metric2,
+        "days":           days,
+        "common_days":    len(common_days),
+        "pearson_r":      round(r, 4),
+        "r_squared":      round(r ** 2, 4),
+        "interpretation": f"{interp} {direction} correlation",
+        "data":           [{"date": d, metric1: avgs1[d], metric2: avgs2[d]} for d in common_days],
+    }
 
 
-def cmd_add(args: argparse.Namespace, planner: FitnessPlanner) -> None:
-    ex = planner.add_exercise(args.name, muscle_group=args.muscle_group,
-                              difficulty=args.difficulty, default_sets=args.sets,
-                              default_reps=args.reps, rest_seconds=args.rest,
-                              calories_per_set=args.calories, notes=args.notes)
-    print(f"{GREEN}✓ Exercise added: #{ex.id} {ex.name} ({ex.muscle_group.value}){NC}")
+def export_report(user_id: str, fmt: str = "json", days: int = 30) -> str:
+    """Generate a health report in JSON or CSV format."""
+    profile = get_profile(user_id)
+    summary = get_summary(user_id, days=days)
+    bmi_info = calculate_bmi(user_id) if profile else {}
+    anomalies = {
+        mt: detect_anomaly(user_id, mt, days=days)
+        for mt in [MetricType.HEART_RATE, MetricType.GLUCOSE, MetricType.OXYGEN_SAT]
+    }
+
+    report = {
+        "generated_at":  datetime.now().isoformat(),
+        "user_id":       user_id,
+        "period_days":   days,
+        "profile":       profile.to_dict() if profile else None,
+        "bmi":           bmi_info,
+        "summary":       summary["metrics"],
+        "anomaly_flags": {k: v["count"] for k, v in anomalies.items()},
+        "anomaly_detail": anomalies,
+    }
+
+    if fmt == "csv":
+        out = StringIO()
+        writer = csv.writer(out)
+        writer.writerow(["metric", "count", "mean", "min", "max", "stddev", "unit", "latest"])
+        for mtype, stats in summary["metrics"].items():
+            writer.writerow([
+                mtype, stats["count"], stats["mean"], stats["min"],
+                stats["max"], stats["stddev"], stats["unit"], stats["latest"],
+            ])
+        return out.getvalue()
+
+    return json.dumps(report, indent=2)
 
 
-def cmd_log(args: argparse.Namespace, planner: FitnessPlanner) -> None:
-    ids = [int(x.strip()) for x in args.exercises.split(",")] if args.exercises else []
-    s   = planner.log_workout(session_date=args.date, exercise_ids=ids,
-                               total_duration=args.duration, mood=args.mood, notes=args.notes)
-    print(f"{GREEN}✓ Workout logged: session #{s.id} on {s.session_date}{NC}")
-    print(f"  Exercises: {len(s.exercises)}  Calories: {s.total_calories:.0f}  "
-          f"Duration: {s.total_duration:.0f}min  Mood: {s.mood}/10")
+# ── CLI ────────────────────────────────────────────────────────────────────────
+
+def _print(obj):
+    if isinstance(obj, str):
+        print(obj)
+    else:
+        print(json.dumps(obj, indent=2, default=str))
 
 
-def cmd_status(args: argparse.Namespace, planner: FitnessPlanner) -> None:
-    s = planner.stats()
-    print(f"\n{BOLD}{BLUE}── Fitness Planner Status {'─'*35}{NC}")
-    print(f"  Sessions logged  : {BOLD}{s['total_sessions']}{NC}  "
-          f"(completed: {GREEN}{s['completed']}{NC})")
-    print(f"  Total calories   : {BOLD}{s['total_calories_burned']:.1f} kcal{NC}")
-    print(f"  Total duration   : {BOLD}{s['total_duration_min']:.1f} min{NC}")
-    print(f"  Average mood     : {BOLD}{s['avg_mood']:.1f}/10{NC}")
-    print(f"  Exercise library : {BOLD}{s['exercises_in_library']}{NC} exercises")
-    print()
+def main():
+    parser = argparse.ArgumentParser(
+        description="BlackRoad Health & Fitness Monitor",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
+    # log
+    p = sub.add_parser("log", help="Record a health metric")
+    p.add_argument("--user",   required=True)
+    p.add_argument("--type",   required=True, choices=[m.value for m in MetricType])
+    p.add_argument("--value",  type=float, required=True)
+    p.add_argument("--unit",   default="")
+    p.add_argument("--device", default="manual")
+    p.add_argument("--notes",  default="")
 
-def cmd_export(args: argparse.Namespace, planner: FitnessPlanner) -> None:
-    n = planner.export_json(args.output)
-    print(f"{GREEN}✓ Exported {n} sessions → {args.output}{NC}")
+    # summary
+    p = sub.add_parser("summary", help="7-day summary stats")
+    p.add_argument("--user", required=True)
+    p.add_argument("--days", type=int, default=7)
 
+    # bmi
+    p = sub.add_parser("bmi", help="Calculate BMI from profile")
+    p.add_argument("--user", required=True)
 
-def build_parser() -> argparse.ArgumentParser:
-    p   = argparse.ArgumentParser(description="BlackRoad Fitness Planner")
-    sub = p.add_subparsers(dest="command", required=True)
+    # anomaly
+    p = sub.add_parser("anomaly", help="Detect anomalous readings")
+    p.add_argument("--user", required=True)
+    p.add_argument("--type", required=True)
+    p.add_argument("--days", type=int, default=30)
 
-    ls = sub.add_parser("list", help="List exercises or sessions")
-    ls.add_argument("target", choices=["exercises", "sessions"], default="sessions", nargs="?")
-    ls.add_argument("--muscle-group", dest="muscle_group", metavar="GROUP")
-    ls.add_argument("--limit", type=int, default=20)
+    # correlate
+    p = sub.add_parser("correlate", help="Pearson correlation between two metrics")
+    p.add_argument("--user", required=True)
+    p.add_argument("--m1",   required=True, dest="metric1")
+    p.add_argument("--m2",   required=True, dest="metric2")
+    p.add_argument("--days", type=int, default=30)
 
-    add = sub.add_parser("add", help="Add an exercise to the library")
-    add.add_argument("name")
-    add.add_argument("--muscle-group", dest="muscle_group", default="full_body",
-                     choices=[x.value for x in MuscleGroup])
-    add.add_argument("--difficulty", default="intermediate",
-                     choices=[x.value for x in Difficulty])
-    add.add_argument("--sets",     type=int,   default=3)
-    add.add_argument("--reps",     type=int,   default=10)
-    add.add_argument("--rest",     type=int,   default=60, metavar="SECONDS")
-    add.add_argument("--calories", type=float, default=20.0, metavar="PER_SET")
-    add.add_argument("--notes",    default="")
+    # report
+    p = sub.add_parser("report", help="Full health report export")
+    p.add_argument("--user",   required=True)
+    p.add_argument("--format", choices=["json", "csv"], default="json", dest="fmt")
+    p.add_argument("--days",   type=int, default=30)
 
-    lg = sub.add_parser("log", help="Log a completed workout")
-    lg.add_argument("--date",      default=None, metavar="YYYY-MM-DD")
-    lg.add_argument("--exercises", metavar="IDS",  help="Comma-separated exercise IDs")
-    lg.add_argument("--duration",  type=float, default=0.0, metavar="MINUTES")
-    lg.add_argument("--mood",      type=int,   default=5, choices=range(1, 11), metavar="1-10")
-    lg.add_argument("--notes",     default="")
+    # profile
+    p = sub.add_parser("profile", help="Set user health profile")
+    p.add_argument("--user",       required=True)
+    p.add_argument("--age",        type=int,   default=0)
+    p.add_argument("--height",     type=float, default=0.0)
+    p.add_argument("--weight",     type=float, default=0.0)
+    p.add_argument("--conditions", nargs="*",  default=[])
+    p.add_argument("--goal-steps", type=int,   default=10000, dest="goal_steps")
+    p.add_argument("--goal-sleep", type=float, default=8.0,   dest="goal_sleep")
+    p.add_argument("--goal-cal",   type=int,   default=2000,  dest="goal_cal")
 
-    sub.add_parser("status", help="Show progress statistics")
+    args = parser.parse_args()
 
-    ex = sub.add_parser("export", help="Export sessions to JSON")
-    ex.add_argument("--output", "-o", default="fitness_export.json")
+    if args.cmd == "log":
+        m = log_metric(args.user, args.type, args.value, args.unit, args.device, args.notes)
+        _print({"status": "logged", "id": m.id, "type": m.type, "value": m.value, "unit": m.unit})
 
-    return p
+    elif args.cmd == "summary":
+        _print(get_summary(args.user, args.days))
 
+    elif args.cmd == "bmi":
+        _print(calculate_bmi(args.user))
 
-def main() -> None:
-    parser  = build_parser()
-    args    = parser.parse_args()
-    planner = FitnessPlanner()
-    {"list": cmd_list, "add": cmd_add, "log": cmd_log,
-     "status": cmd_status, "export": cmd_export}[args.command](args, planner)
+    elif args.cmd == "anomaly":
+        _print(detect_anomaly(args.user, args.type, args.days))
+
+    elif args.cmd == "correlate":
+        _print(correlate(args.user, args.metric1, args.metric2, args.days))
+
+    elif args.cmd == "report":
+        print(export_report(args.user, args.fmt, args.days))
+
+    elif args.cmd == "profile":
+        p = upsert_profile(
+            args.user, args.age, args.height, args.weight,
+            args.conditions, args.goal_steps, args.goal_sleep, args.goal_cal,
+        )
+        _print(p.to_dict())
 
 
 if __name__ == "__main__":
